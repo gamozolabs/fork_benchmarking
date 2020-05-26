@@ -2,6 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::IntoRawFd;
+use std::time::Instant;
 use std::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
 use std::collections::{BTreeSet, HashSet};
 use libc::*;
@@ -11,6 +12,7 @@ pub mod threading;
 /// Statistics for syncing between children in shared memory
 #[derive(Default, Debug)]
 struct Statistics {
+    fuzz_cases: AtomicU64,
     vm_cycles: AtomicU64,
 
     /// Number of "workers" currently "fuzzing"
@@ -73,6 +75,17 @@ fn main() {
     /// Maximum workload to sample to
     const MAX_WORKLOAD: usize = 1000000;
 
+    /// Benchmark the overhead of fork()
+    /// If `false`, this tool will instead benchmark the scaling of fork() with
+    /// cores
+    const BENCH_OVERHEAD: bool = false;
+
+    /// If set, the `Some(bytes)` will tell how many bytes of memory should
+    /// be dirtied (written to) per fuzz case. Only one write will occur per
+    /// page, thus it will be minimal CPU traffic, it's just stressing OS
+    /// paging.
+    const DIRTY_MEMORY: Option<usize> = None; //Some(128 * 1024);
+
     // Create shared memory
     unsafe { create_shared_memory(); }
 
@@ -87,30 +100,41 @@ fn main() {
     let thrscale = (MAX_THREADS as f64 ).powf(1. / THREAD_SAMPLES as f64);
     let wlscale  = (MAX_WORKLOAD as f64).powf(1. / WORKLOAD_SAMPLES as f64);
 
-    // Determine all the tests we should run. This will dedup any duplicate
-    // tests
     let mut tests = BTreeSet::new();
-    let mut threads = 1.0;
-    while (threads as usize) < MAX_THREADS {
-        // Capture the number of threads to use this test
-        let num_threads = threads as u64;
 
-        // Update the threads by the multiplier
-        threads *= thrscale;
-    
-        let mut target_workload = 1.0;
-        while (target_workload as usize) < MAX_WORKLOAD {
-            // Capture the workload
-            let workload = target_workload as u64;
+    if BENCH_OVERHEAD {
+        // Determine all the tests we should run. This will dedup any duplicate
+        // tests
+        let mut threads = 1.0;
 
-            // Update the workload by the multiplier
-            target_workload *= wlscale;
+        while (threads as usize) < MAX_THREADS {
+            // Capture the number of threads to use this test
+            let num_threads = threads as u64;
 
-            // Log that we want to run a test with this number of threads
-            // and the supplied workload
-            tests.insert((num_threads, workload));
+            // Update the threads by the multiplier
+            threads *= thrscale;
+        
+            let mut target_workload = 1.0;
+            while (target_workload as usize) < MAX_WORKLOAD {
+                // Capture the workload
+                let workload = target_workload as u64;
+
+                // Update the workload by the multiplier
+                target_workload *= wlscale;
+
+                // Log that we want to run a test with this number of threads
+                // and the supplied workload
+                tests.insert((num_threads, workload));
+            }
+        }
+    } else {
+        // Just benchmark the scaling of fork WRT cores and fuzz cases
+        for thrs in 1..=MAX_THREADS as u64 {
+            tests.insert((thrs, 0));
         }
     }
+
+    let mut dirtyme = vec![0u8; DIRTY_MEMORY.unwrap_or(0)];
 
     // Run all the tests!
     for &(num_threads, workload) in tests.iter() {
@@ -119,6 +143,9 @@ fn main() {
 
         // Reset statistics
         unsafe { reset_shared_memory(); }
+
+        // Start a wall-clock timer
+        let start_time = Instant::now();
 
         // Start a rdtsc-based timer too
         let start_cycles = rdtsc();
@@ -156,6 +183,15 @@ fn main() {
 
                     if subchild == 0 {
                         let it = rdtsc();
+
+                        // Dirty memory as requested
+                        for ii in
+                                (0..DIRTY_MEMORY.unwrap_or(0)).step_by(4096) {
+                            unsafe {
+                                core::ptr::write_volatile(&mut dirtyme[ii], 5);
+                            }
+                        }
+
                         unsafe {
                             llvm_asm!(r#"
 
@@ -178,6 +214,8 @@ fn main() {
                         }
                         let elapsed = rdtsc() - it;
 
+                        shmem.fuzz_cases.fetch_add(1, Ordering::SeqCst);
+                                                   
                         shmem.vm_cycles.fetch_add(elapsed,
                                                   Ordering::Relaxed);
                 
@@ -212,15 +250,22 @@ fn main() {
         // All children are done, log number of cycles
         let elapsed_cycles = rdtsc() - start_cycles;
 
+        // Get elapsed time in seconds
+        let elapsed = (Instant::now() - start_time).as_secs_f64();
+
+        // Compute fuzz cases/second
+        let fcps = shmem.fuzz_cases.load(Ordering::SeqCst) as f64 / elapsed;
+
         // Just make sure all workers are "done", this should never happen
         // unless we broke something
         assert!(shmem.workers.load(Ordering::SeqCst) == 0);
 
-        print!("{:10} {:14} {:12.6}\n",
+        print!("{:10} {:14} {:12.6} {:12.6}\n",
                num_threads,
                workload * (16 + 2),
                shmem.vm_cycles.load(Ordering::Relaxed) as f64 /
-               (elapsed_cycles as f64 * num_threads as f64));
+               (elapsed_cycles as f64 * num_threads as f64),
+               fcps / num_threads as f64);
     }    
 }
 
