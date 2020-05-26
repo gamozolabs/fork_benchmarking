@@ -6,5 +6,5 @@ TL;DR: This is an absolute best-case scenario for fork()-based VM resetting, wit
 
 # Data
 
-![data][graph.png]
+![data](graph.png)
 
